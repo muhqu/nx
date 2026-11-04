@@ -53,6 +53,7 @@ import {
 } from './task-env';
 import { TaskStatus } from './tasks-runner';
 import { Batch, TasksSchedule } from './tasks-schedule';
+import { getTaskWeight } from './task-weight';
 import {
   calculateReverseDeps,
   expandInitiatingTasksThroughNoop,
@@ -137,6 +138,7 @@ export class TaskOrchestrator {
   private completedTasks = new Map<string, TaskStatus>();
   private waitingForTasks: Function[] = [];
   private pendingDiscreteWorkers = new Set<Promise<TaskResult | void>>();
+  private discreteWorkerWeight = 0;
 
   private groups: boolean[] = [];
   private continuousTasksStarted = 0;
@@ -335,10 +337,18 @@ export class TaskOrchestrator {
 
       // 5. Dispatch cache misses as individual workers
       while (this.pendingDiscreteWorkers.size < parallelism) {
-        const task = this.tasksSchedule.nextTask((t) => !t.continuous);
+        const freeSlots = parallelism - this.discreteWorkerWeight;
+        const task = this.tasksSchedule.nextTask(
+          (t) => !t.continuous && getTaskWeight(t, parallelism) <= freeSlots
+        );
         if (!task) break;
         const groupId = this.closeGroup();
-        this.dispatchDiscreteWorker(doNotSkipCache, task, groupId);
+        this.dispatchDiscreteWorker(
+          doNotSkipCache,
+          task,
+          groupId,
+          getTaskWeight(task, parallelism)
+        );
       }
 
       // 6. Nothing left to dispatch and nothing in flight — done.
@@ -976,8 +986,10 @@ export class TaskOrchestrator {
   private dispatchDiscreteWorker(
     doNotSkipCache: boolean,
     task: Task,
-    groupId: number
+    groupId: number,
+    weight: number
   ): void {
+    this.discreteWorkerWeight += weight;
     const worker = this.runTaskDirectly(doNotSkipCache, task, groupId)
       .catch((e) =>
         this.handleDiscreteWorkerFailure(doNotSkipCache, task, groupId, e)
@@ -985,6 +997,7 @@ export class TaskOrchestrator {
       .finally(() => {
         this.openGroup(groupId);
         this.pendingDiscreteWorkers.delete(worker);
+        this.discreteWorkerWeight -= weight;
         // Wake coordinator — the delete above may satisfy the exit condition
         // (pendingDiscreteWorkers.size === 0) that was missed when
         // scheduleNextTasksAndReleaseThreads fired earlier.
